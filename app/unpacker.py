@@ -247,6 +247,46 @@ def load_and_verify(layout_dir, workdir):
 # ---------------------------------------------------------------------------
 
 
+def _resolve_components(probe, components):
+    """Shared path-resolution loop (used by the on-disk unpacker and the
+    in-memory stats overlay, so both resolve paths exactly the same way).
+
+    *probe* is called with the tuple of components resolved so far plus one
+    candidate component; it must return ``None`` when nothing exists there,
+    ``("link", target)`` for a symlink or ``("other", None)`` for anything
+    else.  Returns the resolved list of components.  The final component is
+    never dereferenced (writes operate on it, not through it).  Raises
+    UnpackError if the path would escape the rootfs.
+    """
+    shown = "/".join(components)
+    parts = []  # resolved components so far, relative to root
+    todo = [p for p in components if p not in ("", ".")]
+    depth = 0
+    while todo:
+        comp = todo.pop(0)
+        if comp == "..":
+            if not parts:
+                raise UnpackError(f"path escapes rootfs: {shown!r}")
+            parts.pop()
+            continue
+        node = probe(tuple(parts + [comp]))
+        if node is None:
+            parts.append(comp)
+            continue
+        if node[0] == "link" and todo:
+            depth += 1
+            if depth > MAX_SYMLINK_DEPTH:
+                raise UnpackError(f"too many symlinks resolving {shown!r}")
+            target = node[1]
+            tparts = [p for p in target.split("/") if p not in ("", ".")]
+            if target.startswith("/"):
+                parts = []  # absolute symlink: relative to rootfs root
+            todo = tparts + todo
+        else:
+            parts.append(comp)
+    return parts
+
+
 def _resolve_within(root, relpath):
     """Resolve *relpath* against *root*, following existing symlinks.
 
@@ -254,48 +294,31 @@ def _resolve_within(root, relpath):
     The final component is never dereferenced (writes operate on it, not
     through it).  Raises UnpackError if the path would escape.
     """
-    parts = []  # resolved components so far, relative to root
-    todo = [p for p in relpath.split("/") if p not in ("", ".")]
-    depth = 0
-    while todo:
-        comp = todo.pop(0)
-        if comp == "..":
-            if not parts:
-                raise UnpackError(f"path escapes rootfs: {relpath!r}")
-            parts.pop()
-            continue
-        candidate = os.path.join(root, *parts, comp)
+    def probe(parts):
+        candidate = os.path.join(root, *parts)
         try:
             st = os.lstat(candidate)
         except FileNotFoundError:
-            parts.append(comp)
-            continue
+            return None
         except OSError as e:
             raise UnpackError(f"cannot inspect {relpath!r}: {e}")
-        if stat.S_ISLNK(st.st_mode) and todo:
-            depth += 1
-            if depth > MAX_SYMLINK_DEPTH:
-                raise UnpackError(f"too many symlinks resolving {relpath!r}")
-            target = os.readlink(candidate)
-            tparts = [p for p in target.split("/") if p not in ("", ".")]
-            if target.startswith("/"):
-                parts = []  # absolute symlink: relative to rootfs root
-            todo = tparts + todo
-        else:
-            parts.append(comp)
-    return os.path.join(root, *parts)
+        if stat.S_ISLNK(st.st_mode):
+            return ("link", os.readlink(candidate))
+        return ("other", None)
+
+    return os.path.join(root, *_resolve_components(probe, relpath.split("/")))
 
 
-def _check_link_target(root, dest_dir_abs, linkname):
-    """A symlink created in *dest_dir_abs* with target *linkname* must stay
-    inside *root* (absolute targets are rootfs-relative, as in containers)."""
+def _check_link_target_parts(base_parts, linkname):
+    """A symlink created in directory *base_parts* (rootfs-relative) with
+    target *linkname* must stay inside the rootfs (absolute targets are
+    rootfs-relative, as in containers)."""
     if not isinstance(linkname, str) or not linkname or "\x00" in linkname:
         raise UnpackError(f"invalid symlink target: {linkname!r}")
     if linkname.startswith("/"):
         parts = []
     else:
-        rel = os.path.relpath(dest_dir_abs, root)
-        parts = [] if rel == "." else rel.split(os.sep)
+        parts = list(base_parts)
     for p in linkname.split("/"):
         if p in ("", "."):
             continue
@@ -305,6 +328,14 @@ def _check_link_target(root, dest_dir_abs, linkname):
             parts.pop()
         else:
             parts.append(p)
+
+
+def _check_link_target(root, dest_dir_abs, linkname):
+    """A symlink created in *dest_dir_abs* with target *linkname* must stay
+    inside *root* (absolute targets are rootfs-relative, as in containers)."""
+    rel = os.path.relpath(dest_dir_abs, root)
+    base = [] if rel == "." else rel.split(os.sep)
+    _check_link_target_parts(base, linkname)
 
 
 # ---------------------------------------------------------------------------
@@ -418,34 +449,57 @@ def _apply_entry(tf, member, rel, rootfs, dir_meta):
 # ---------------------------------------------------------------------------
 
 
-def apply_layer(tar_path, rootfs, dir_meta):
+def _open_layer(tar_path):
+    """Open a verified layer tar and read its member table.
+
+    Returns ``(tarfile, members)``; the caller closes the tarfile.
+    """
     try:
         tf = tarfile.open(tar_path, "r:")
     except (tarfile.TarError, OSError) as e:
         raise UnpackError(f"corrupt layer tar: {e}")
-    with tf:
-        try:
-            members = tf.getmembers()
-        except tarfile.TarError as e:
-            raise UnpackError(f"corrupt layer tar: {e}")
+    try:
+        members = tf.getmembers()
+    except tarfile.TarError as e:
+        tf.close()
+        raise UnpackError(f"corrupt layer tar: {e}")
+    return tf, members
 
-        entries = []
-        deletions = []
-        opaque_dirs = []
-        for m in members:
-            parts = _normalize_archive_name(m.name, "layer entry")
-            if not parts:
-                continue
-            base = parts[-1]
-            if base == OPAQUE_MARKER:
-                opaque_dirs.append(parts[:-1])
-            elif base.startswith(WHITEOUT_PREFIX):
-                target_name = base[len(WHITEOUT_PREFIX):]
-                if not target_name:
-                    raise UnpackError(f"invalid whiteout entry: {m.name!r}")
-                deletions.append(parts[:-1] + [target_name])
-            else:
-                entries.append((m, parts))
+
+def scan_layer_members(members):
+    """Split layer tar members into content entries, whiteout deletions and
+    opaque-dir markers.
+
+    Shared by the on-disk unpacker and the in-memory stats overlay so both
+    classify entries (and therefore apply layers) exactly the same way.
+    Returns ``(entries, deletions, opaque_dirs)`` where *entries* is a list
+    of ``(member, parts)`` in tar order and the other two are lists of path
+    component lists.
+    """
+    entries = []
+    deletions = []
+    opaque_dirs = []
+    for m in members:
+        parts = _normalize_archive_name(m.name, "layer entry")
+        if not parts:
+            continue
+        base = parts[-1]
+        if base == OPAQUE_MARKER:
+            opaque_dirs.append(parts[:-1])
+        elif base.startswith(WHITEOUT_PREFIX):
+            target_name = base[len(WHITEOUT_PREFIX):]
+            if not target_name:
+                raise UnpackError(f"invalid whiteout entry: {m.name!r}")
+            deletions.append(parts[:-1] + [target_name])
+        else:
+            entries.append((m, parts))
+    return entries, deletions, opaque_dirs
+
+
+def apply_layer(tar_path, rootfs, dir_meta):
+    tf, members = _open_layer(tar_path)
+    with tf:
+        entries, deletions, opaque_dirs = scan_layer_members(members)
 
         # Phase 1: deletions apply to the *lower* filesystem state only.
         # They are all executed before anything from this layer is written,
